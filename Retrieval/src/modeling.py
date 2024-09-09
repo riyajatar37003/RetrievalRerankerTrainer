@@ -89,8 +89,8 @@ class BiEncoderModel(nn.Module):
         presp = torch.nn.functional.normalize(presp, dim=-1)
         
         # Step 1: Expand dimensions of q and p for broadcasting
-        q_expanded = qreps.unsqueeze(1)  # Shape: (2, 1, 10, 32)
-        p_expanded = presp.unsqueeze(0)  # Shape: (1, 16, 152, 32)
+        q_expanded = qreps.unsqueeze(1)  # Shape: (2, 1, 10, 32) # here shape :[b,1,num_of_query_tokens,hidden_dim]
+        p_expanded = presp.unsqueeze(0)  # Shape: (1, 16, 152, 32) # here shape: [1,grp_size*b,num_of_pass_tokens,hidden_dim]
         
         # Step 2: Perform matrix multiplication using torch.matmul
         # We want to multiply along the last dimension (size 32)
