@@ -125,7 +125,7 @@ class BiEncoderModel(nn.Module):
 
                 
                 w1 = 1
-                w3 = 0.3
+                w3 = 1
                 lambda1 = 1
                 lammbda2 = 1
                 
