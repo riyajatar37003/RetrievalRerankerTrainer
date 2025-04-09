@@ -1,13 +1,12 @@
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional
-import numpy as np
+
 import torch
 import torch.distributed as dist
 from torch import nn, Tensor
 from transformers import AutoModel
 from transformers.file_utils import ModelOutput
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +33,13 @@ class BiEncoderModel(nn.Module):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_name)
         self.cross_entropy = nn.CrossEntropyLoss(reduction='mean')
-        self.kld_loss = nn.KLDivLoss(reduction='batchmean',log_target=True)
+
         self.normlized = normlized
         self.sentence_pooling_method = sentence_pooling_method
         self.temperature = temperature
         self.use_inbatch_neg = use_inbatch_neg
         self.config = self.model.config
-        
+
         if not normlized:
             self.temperature = 1.0
             logger.info("reset temperature = 1.0 due to using inner product to compute similarity")
@@ -76,37 +75,16 @@ class BiEncoderModel(nn.Module):
         p_reps = self.sentence_embedding(psg_out.last_hidden_state, features['attention_mask'])
         if self.normlized:
             p_reps = torch.nn.functional.normalize(p_reps, dim=-1)
-        return p_reps.contiguous(),psg_out.last_hidden_state
+        return p_reps.contiguous()
 
     def compute_similarity(self, q_reps, p_reps):
         if len(p_reps.size()) == 2:
             return torch.matmul(q_reps, p_reps.transpose(0, 1))
         return torch.matmul(q_reps, p_reps.transpose(-2, -1))
-        
-    def multivector_score(self,qreps,presp):
-
-        qreps = torch.nn.functional.normalize(qreps, dim=-1)
-        presp = torch.nn.functional.normalize(presp, dim=-1)
-        
-        # Step 1: Expand dimensions of q and p for broadcasting
-        q_expanded = qreps.unsqueeze(1)  # Shape: (2, 1, 10, 32) # here shape :[b,1,num_of_query_tokens,hidden_dim]
-        p_expanded = presp.unsqueeze(0)  # Shape: (1, 16, 152, 32) # here shape: [1,grp_size*b,num_of_pass_tokens,hidden_dim]
-        
-        # Step 2: Perform matrix multiplication using torch.matmul
-        # We want to multiply along the last dimension (size 32)
-        result = torch.matmul(q_expanded, p_expanded.transpose(-1, -2))  # Shape: (2, 16, 10, 152)
-        
-        # The resulting shape should be (2, 16, 10, 152), which represents:
-        # 2 batches of queries, each compared with 16 batches of passages, 
-        # resulting in 10x152 similarity scores.
-        score,_ = torch.max(torch.max(result,axis=-1)[0],axis=-1)
-        return score
-        
 
     def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None, teacher_score: Tensor = None):
-        q_reps,q_h = self.encode(query)
-        p_reps,p_h = self.encode(passage)
-        mv_scores = self.multivector_score(q_h,p_h)
+        q_reps = self.encode(query)
+        p_reps = self.encode(passage)
         
         
         if self.training:
@@ -116,43 +94,14 @@ class BiEncoderModel(nn.Module):
 
             group_size = p_reps.size(0) // q_reps.size(0)
             if self.use_inbatch_neg:
-                scores = self.compute_similarity(q_reps, p_reps)/self.temperature #/ self.temperature # B B*G
+                scores = self.compute_similarity(q_reps, p_reps) / self.temperature # B B*G
                 scores = scores.view(q_reps.size(0), -1)
-                mv_scores = mv_scores.view(q_reps.size(0), -1)/self.temperature
-                
+
                 target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
                 target = target * group_size
-
-                
-                w1 = 1
-                w3 = 1
-                lambda1 = 1
-                lammbda2 = 1
-                
-                s_inter = w1*scores + w3*mv_scores
-                
-                loss_dense1 = self.compute_loss(scores, target)
-                loss_mulvec1 = self.compute_loss(mv_scores, target)
-                loss_inter = self.compute_loss(s_inter, target)
-                
-                s_logits1 =  F.log_softmax(scores, dim=1)
-                s_logits2 =  F.log_softmax(mv_scores, dim=1)
-                
-                t_logits =  F.log_softmax(s_inter, dim=1)
-
-                loss_dense2 = self.kld_loss(s_logits1, t_logits)
-                loss_mulvec1 = self.kld_loss(s_logits2, t_logits)
-
-                L1 = 0.3*(loss_dense1*lambda1 + loss_mulvec1*lammbda2 + loss_inter)
-                L2 = 0.2*(loss_dense2*lambda1  + loss_mulvec1*lammbda2)
-                
-                loss = (L1 + L2)*0.5
-                # In order to reduce the impact of this, we set w1 =1,w2 =0.3, w3 = 1,λ1 = 1,λ2 = 0.1and λ3 = 1
-
-                
-                
+                loss = self.compute_loss(scores, target)
             else:
-                scores = self.compute_similarity(q_reps[:, None, :,], p_reps.view(q_reps.size(0), group_size, -1)).squeeze(1)*np.exp(3) #/ self.temperature # B G
+                scores = self.compute_similarity(q_reps[:, None, :,], p_reps.view(q_reps.size(0), group_size, -1)).squeeze(1) / self.temperature # B G
 
                 scores = scores.view(q_reps.size(0), -1)
                 target = torch.zeros(scores.size(0), device=scores.device, dtype=torch.long)
@@ -170,7 +119,6 @@ class BiEncoderModel(nn.Module):
 
     def compute_loss(self, scores, target):
         return self.cross_entropy(scores, target)
-        # 
 
     def _dist_gather_tensor(self, t: Optional[torch.Tensor]):
         if t is None:
